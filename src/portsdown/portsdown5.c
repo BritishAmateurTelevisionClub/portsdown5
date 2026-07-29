@@ -123,6 +123,7 @@ int TouchTrigger = 0;
 bool touchneedsinitialisation = true;
 bool VirtualTouch = false;             // used to simulate a screen touch if a monitored event finishes
 int FinishedButton = 0;                // Used to indicate screentouch during TX or RX
+int StreamFinishedButton = 0;          // Used to indicate screentouch during Stream RX
 int touch_response = 0;                // set to 1 on touch and used to reboot display if it locks up
 
 // Mouse control variables
@@ -179,12 +180,14 @@ char LMRXvolts[7];          // off, v or h
 char RXmod[7];              // DVB-S or DVB-T
 bool VLCResetRequest = false; // Set on touchsscreen request for VLC to be reset  
 int  CurrentVLCVolume = 256;  // Read from config file
-char player[63];            // vlc or ffplay                   
+char player[63];            // vlc or ffplay 
+bool RXdiagnostics = false; //  Set true to enable screenshot of RX diagnostics                  
 
 // LongMynd RX Received Parameters for display
 bool timeOverlay = false;    // Display time overlay on received metadata and snaps
 time_t t;                    // current time
 char customAudioOut[127];    // Custom Audio Out device name
+int masterAudioVolume;       // alsamixer audio volume
 
 // Stream Player
 bool amendStreamPreset = false;        // Set to amend a stream preset
@@ -194,11 +197,16 @@ char streamLabel[21][63];              // stream Button Label read from config f
 char StreamKey[9][63];                 // transmit stream name-key
 bool StreamerStoreTrigger = false;     // Set true to enable transmit stream to be changed
 
+// Test Card Variables
+char testcard[63] = "tcf";             // Name of test card selected             
+char caption[7] = "on";                // Caption on test card
+           
 // Threads
 pthread_t thtouchscreen;               //  listens to the touchscreen
 pthread_t thwebclick;                  //  Listens for clicks from web interface
 pthread_t thmouse;                     //  Listens to the mouse
 pthread_t thbutton;                    //  Listens during receive
+pthread_t thstream;                    //  Listens during streamer
 
 // ******************** Menus for Reference *********************************
 
@@ -230,6 +238,7 @@ pthread_t thbutton;                    //  Listens during receive
 // 26 Stream TX presets
 // 32 Decision of 2
 // 33 Decision of 3
+// 39 Select Test Card
 
 // 41 Alpha Keyboard
 
@@ -271,6 +280,7 @@ void handle_mouse();
 void *WebClickListener(void * arg);
 void parseClickQuerystring(char *query_string, int *x_ptr, int *y_ptr);
 FFUNC touchscreenClick(ffunc_session_t * session);
+void *WaitButtonStream(void * arg);
 void *WaitButtonLMRX(void * arg);
 void wait_touch();
 
@@ -359,6 +369,8 @@ void Define_Menu32();
 void Highlight_Menu32();
 void Define_Menu33();
 void Highlight_Menu33();
+void Define_Menu39();
+void Highlight_Menu39();
 void Define_Menu41();
 void Define_Menus();
 void Keyboard(char *RequestText, char *InitText, int MaxLength, char *KeyboardReturn, bool UpperCase);
@@ -400,6 +412,9 @@ void AdjustVLCVolume(int adjustment);
 void ChangeStreamPreset(int NoButton);
 void ToggleAmendStreamPreset();
 void ChangeCustomAudioOut();
+void ChangeMasterVolume();
+void SetMasterVolume();
+void ChangeVLCVolume();
 void CheckforUpdate();
 void SelectStreamerAction(int NoButton);
 void AmendStreamerPreset(int NoButton);
@@ -580,17 +595,35 @@ void SetConfigParam(char *PathConfigFile, char *Param, char *Value)
 void CheckConfigFile()
 {
   char shell_command[255];
-  FILE *fp;
   int r;
 
-  // Add customaudioout to System Config file
+  // Add customaudioout to System Config file if required
   sprintf(shell_command, "grep -q 'customaudioout=' %s", PATH_SCONFIG);
-  fp = popen(shell_command, "r");
-  r = pclose(fp);
-  if (WEXITSTATUS(r) != 0)
+  r = system(shell_command);
+  if (r != 0)
   {
     printf("Updating Config File with customaudioout\n");
     sprintf(shell_command, "echo customaudioout=not_set >> %s", PATH_SCONFIG);
+    system(shell_command); 
+  }
+
+  // Add masteraudiovolume to System Config file if required
+  sprintf(shell_command, "grep -q 'masteraudiovolume=' %s", PATH_SCONFIG);
+  r = system(shell_command);
+  if (r != 0)
+  {
+    printf("Updating Config File with masteraudiovolume\n");
+    sprintf(shell_command, "echo masteraudiovolume=50 >> %s", PATH_SCONFIG);
+    system(shell_command); 
+  }
+
+  // Add testcard to Portsdown Config file if required
+  sprintf(shell_command, "grep -q 'testcard=' %s", PATH_PCONFIG);
+  r = system(shell_command);
+  if (r != 0)
+  {
+    printf("Updating Config File with testcard\n");
+    sprintf(shell_command, "echo testcard=tcf >> %s", PATH_PCONFIG);
     system(shell_command); 
   }
 }
@@ -643,11 +676,23 @@ void ReadSavedParams()
   GetConfigParam(PATH_PCONFIG, "fec", response);
   config.fec = atoi(response);
 
+  strcpy(response, "0");  // highlight null responses
+  GetConfigParam(PATH_PCONFIG, "testcard", response);
+  strcpy(testcard, response);
+
+  strcpy(response, "0");  // highlight null responses
+  GetConfigParam(PATH_PCONFIG, "caption", response);
+  strcpy(caption, response);
+
   // Band?
 
   strcpy(response, "0");  // highlight null responses
   GetConfigParam(PATH_PCONFIG, "limegain", response);
   config.limegain = atoi(response);
+
+  strcpy(response, "256");  // default response
+  GetConfigParam(PATH_PCONFIG, "vlcvolume", response);
+  CurrentVLCVolume = atoi(response);
 
   // System Config File
 
@@ -714,6 +759,10 @@ void ReadSavedParams()
   strcpy(response, "not_set");  // highlight null responses
   GetConfigParam(PATH_SCONFIG, "customaudioout", response);
   strcpy(customAudioOut, response);
+
+  strcpy(response, "50");  // set default response
+  GetConfigParam(PATH_SCONFIG, "masteraudiovolume", response);
+  masterAudioVolume = atoi(response);
 
   // Read the LongMynd RX presets
 
@@ -1367,6 +1416,56 @@ FFUNC touchscreenClick(ffunc_session_t * session)
 }
 
 
+void *WaitButtonStream(void * arg)
+{
+  int rawX, rawY;
+  StreamFinishedButton = 1;   // No touch
+
+  while(StreamFinishedButton == 1)
+  {
+    while(getTouchSample(&rawX, &rawY) == 0);  // Wait here for touch
+
+    if((scaledX <= 5 * wscreen / 40)  &&  (scaledY <= 2 * hscreen / 12) && (strcmp(DisplayType, "hdmi") != 0)) // Bottom left
+    {
+      printf("In snap zone, so take snap.\n");
+      system("/home/pi/portsdown/scripts/receive/vlcsnap.sh");
+    }
+    else if((scaledX <= 5 * wscreen / 40)  && (scaledY >= 10 * hscreen / 12) && (strcmp(DisplayType, "hdmi") != 0))  // Top left
+    {
+      printf("In restart VLC zone, so set for reset.\n");
+      VLCResetRequest = true;
+    }
+    else if((scaledX >= 35 * wscreen / 40) && (scaledY >= 8 * hscreen / 12) && (strcmp(DisplayType, "hdmi") != 0))  // Top Right
+    {
+      printf("Volume Up.\n");
+      AdjustVLCVolume(51);
+    }
+    else if((scaledX >= 35 * wscreen / 40) && (scaledY >= 4 * hscreen / 12) && (scaledY < 8 * hscreen / 12) && (strcmp(DisplayType, "hdmi") != 0))  // mid Right
+    {
+      printf("Volume Mute.\n");
+      AdjustVLCVolume(-512);
+    }
+    else if((scaledX >= 35 * wscreen / 40) && (scaledY < 4 * hscreen / 12) && (strcmp(DisplayType, "hdmi") != 0))  // Bottom Right
+    {
+      printf("Volume Down.\n");
+      AdjustVLCVolume(-51);
+    }
+    else                                                         // Not on a button, so close VLC
+    {
+      printf("Touch away from buttons\n");
+
+      // Exit streaming
+      StreamFinishedButton = 0;
+
+      // Close VLC to reduce processor load first
+      system("/home/pi/portsdown/scripts/receive/lmvlcclose.sh");
+      printf("VLC closed\n");
+    }
+  }
+  return NULL;
+}
+
+
 void *WaitButtonLMRX(void * arg)
 {
   int rawX, rawY;
@@ -1380,7 +1479,15 @@ void *WaitButtonLMRX(void * arg)
     if((scaledX <= 5 * wscreen / 40)  &&  (scaledY <= 2 * hscreen / 12) && (strcmp(DisplayType, "hdmi") != 0)) // Bottom left
     {
       printf("In snap zone, so take snap.\n");
-      system("/home/pi/portsdown/scripts/receive/vlcsnap.sh");
+
+      if (RXdiagnostics == true)
+      {
+        system("/home/pi/portsdown/scripts/snap.sh");
+      }
+      else
+      {
+        system("/home/pi/portsdown/scripts/receive/vlcsnap.sh");
+      }
     }
     else if((scaledX <= 5 * wscreen / 40)  && (scaledY >= 10 * hscreen / 12) && (strcmp(DisplayType, "hdmi") != 0))  // Top left
     {
@@ -1971,6 +2078,7 @@ void LMRX(int NoButton)
 
   case 1:  // DVB-S/S2 Receive Diagnostics
     clearScreen(0, 0, 0);
+    RXdiagnostics = true;
 
     fp=popen(PATH_SCRIPT_LMRXUDP, "r");
     if(fp==NULL) printf("Process error\n");
@@ -2273,6 +2381,8 @@ void LMRX(int NoButton)
     } 
     close(fd_status_fifo); 
     usleep(1000);
+
+    RXdiagnostics = false;
 
     printf("Stopping receive process\n");
     pclose(fp);
@@ -2758,7 +2868,7 @@ void playStreamFFPlay()
   int rawX;
   int rawY;
 
-  MsgBox4(" ", " ", "Starting stream player", " ");
+  MsgBox4(" ", " ", "Starting ffplay stream player", " ");
 
   system("/home/pi/portsdown/scripts/playstream/ffplay_stream_player.sh >/dev/null 2>/dev/null &");
 
@@ -2773,19 +2883,27 @@ void playStreamFFPlay()
 
 void playStreamVLC()
 {
-  int rawX;
-  int rawY;
+  MsgBox4("Starting VLC stream player", " ", "Please wait", " ");
 
-  MsgBox4(" ", " ", "Starting stream player", " ");
-
+  // Start the stream display script
   system("/home/pi/portsdown/scripts/playstream/vlc_stream_player.sh >/dev/null 2>/dev/null &");
 
-  // Wait for touch
-  while(getTouchSample(&rawX, &rawY) == 0)
+  // Create screen touch thread
+  pthread_create (&thstream, NULL, &WaitButtonStream, NULL);
+
+  StreamFinishedButton = 1;
+
+  // Wait for the screen to be touched in the right place to stop the stream display
+  while (StreamFinishedButton != 0)
   {
     usleep(10000);
   }
+
+  // close VLC
   system("/home/pi/portsdown/scripts/playstream/vlc_stream_player_stop.sh >/dev/null 2>/dev/null &");
+
+  // Close the screen touch thread
+  pthread_join(thstream, NULL);
 }
 
 
@@ -3002,7 +3120,6 @@ int AddButtonStatus(int menu, int button_number, char *Text, color_t *Color)
 }
 
 
-//void SetButtonStatus(int ButtonIndex,int Status)
 void SetButtonStatus(int menu, int button_number, int Status)
 {
   button_t *Button = &(ButtonArray[menu][button_number]);
@@ -3017,7 +3134,6 @@ int GetButtonStatus(int menu, int button_number)
 }
 
 
-//void SelectInGroupOnMenu(int Menu, int StartButton, int StopButton, int NumberButton, int Status)
 void SelectInGroupOnMenu(int menu, int firstButton, int lastButton, int NumberButton, int Status)
 {
   int i;
@@ -3375,6 +3491,9 @@ void redrawMenu()
     case 26:
       Highlight_Menu26();
       break;
+    case 39:
+      Highlight_Menu39();
+      break;
   }
   
   // Draw each button in turn
@@ -3626,6 +3745,12 @@ void Highlight_Menu1()
     AmendButtonStatus(1, 22, 1, "Output to^Express 32", &Green);
     isLime = false;
   }
+  if (strcmp(config.modeoutput, "LIBRESDR") == 0)
+  {
+    AmendButtonStatus(1, 22, 0, "Output to^LibreSDR", &Blue);
+    AmendButtonStatus(1, 22, 1, "Output to^LibreSDR", &Green);
+    isLime = false;
+  }
   if (strcmp(config.modeoutput, "LIMEMINI") == 0)
   {
     AmendButtonStatus(1, 22, 0, "Output to^Lime Mini", &Blue);
@@ -3804,9 +3929,9 @@ void Define_Menu3()
 
   AddButtonStatus(3, 4, "Return to^Main Menu", &Blue);
 
-  AddButtonStatus(3, 20, "Set Stream^Outputs", &Blue);
+  AddButtonStatus(3, 15, "Select^Test Card", &Blue);
 
-  AddButtonStatus(3, 21, "Custom Audio^Out Device", &Blue);
+  AddButtonStatus(3, 20, "Set Stream^Outputs", &Blue);
 }
 
 
@@ -3847,8 +3972,6 @@ void Define_Menu5()
   AddButtonStatus(5, 5, "IPTS^Monitor", &Blue);
 
   AddButtonStatus(5, 4, "Return to^Main Menu", &Blue);
-
-
 }
 
 
@@ -3865,14 +3988,46 @@ void Define_Menu6()
   AddButtonStatus(6, 0, "Start-up^App", &Blue);
 
   AddButtonStatus(6, 4, "Return to^Main Menu", &Blue);
+
+  AddButtonStatus(6, 20, "Set Master^Volume", &Blue);
+
+  AddButtonStatus(6, 21, "Set VLC^Volume", &Blue);
+
+  AddButtonStatus(6, 22, "Custom Audio^Out Device", &Blue);
+
+  AddButtonStatus(6, 24, "Audio out^RPi Jack", &Blue);
+  AddButtonStatus(6, 24, "Audio out^USB Dongle", &Blue);
+  AddButtonStatus(6, 24, "Audio out^HDMI", &Blue);
+  AddButtonStatus(6, 24, "Audio out^Custom", &Grey);
 }
 
 
 void Highlight_Menu6()
 {
+  char audioText[63];
+  char shortaudioText[40];
+
+  if (strcmp(LMRXaudio, "rpi") == 0)
+  {
+    SetButtonStatus(6, 24, 0);
+  }
+  else if (strcmp(LMRXaudio, "usb") == 0)
+  {
+    SetButtonStatus(6, 24, 1);
+  }
+  else if (strcmp(LMRXaudio, "hdmi") == 0)
+  {
+    SetButtonStatus(6, 24, 2);
+  }
+  else
+  {
+    strcpyn(shortaudioText, customAudioOut, 30);
+    snprintf(audioText, 63, "Audio out^%s", shortaudioText);
+    AmendButtonStatus(6, 24, 3, audioText, &Blue);
+    SetButtonStatus(6, 24, 3);
+  }
 
 }
-
 
 
 void Define_Menu7()
@@ -4062,7 +4217,7 @@ void Define_Menu8()
   AddButtonStatus(8, 27, "EXIT", &Blue);
   AddButtonStatus(8, 27, "EXIT", &Red);
 
-  AddButtonStatus(8, 28, "Config", &Blue);
+  AddButtonStatus(8, 28, "Receive^Config Menu", &Blue);
   AddButtonStatus(8, 28, "Config", &Green);
 
   AddButtonStatus(8, 29, "DVB-S/S2", &Blue);
@@ -4318,7 +4473,7 @@ void Highlight_Menu8()
 
 void Define_Menu9()
 {
-  strcpy(MenuTitle[9], "Transmit Control Menu (9)");
+  strcpy(MenuTitle[9], "Transmit Monitoring Menu (9)");
 
   AddButtonStatus(9, 4, "Stop^Transmit", &DBlue);
 
@@ -4330,9 +4485,9 @@ void Define_Menu9()
   AddButtonStatus(9, 19, "Lime Gain^88",&Green);
   AddButtonStatus(9, 19, "Lime Gain^88",&Grey);
 
-  AddButtonStatus(9, 20, "DVB-S^QPSK", &Blue);
-  AddButtonStatus(9, 20, "DVB-S^QPSK", &Green);
   AddButtonStatus(9, 20, "DVB-S^QPSK", &Grey);
+
+  AddButtonStatus(9, 21, "Encoding^ ", &Grey);
 
   AddButtonStatus(9, 23, "Format^16:9", &Blue);
   AddButtonStatus(9, 23, "Format^16:9", &Green);
@@ -4348,8 +4503,6 @@ void Define_Menu9()
 
   AddButtonStatus(9, 27, "PTT On",&Red);
   AddButtonStatus(9, 27, "PTT Off",&Blue);
-
-  AddButtonStatus(9, 28, "Show^Video",&Blue);
 }
 
 
@@ -4371,110 +4524,97 @@ void Highlight_Menu9()
   AmendButtonStatus(9, 19, 2, limegainLabel, &Grey);
   SetButtonStatus(9, 19, 2);
 
+  // Display Correct Modulation on Button 20
+  if (strcmp(config.modulation, "DVBS") == 0)
+  {
+    AmendButtonStatus(9, 20, 0, "Modulation^DVB-S", &Grey);
+  }
+  if (strcmp(config.modulation, "S2QPSK") == 0)
+  {
+    AmendButtonStatus(9, 20, 0, "Modulation^DVB-S2 QPSK", &Grey);
+  }
+  if (strcmp(config.modulation, "8PSK") == 0)
+  {
+    AmendButtonStatus(9, 20, 0, "Modulation^DVB-S2 8PSK", &Grey);
+  }
+  if (strcmp(config.modulation, "16APSK") == 0)
+  {
+    AmendButtonStatus(9, 20, 0, "Modulation^S2 16APSK", &Grey);
+  }
+  if (strcmp(config.modulation, "32APSK") == 0)
+  {
+    AmendButtonStatus(9, 20, 0, "Modulation^S2 32APSK", &Grey);
+  }
+
   // Display Correct Encoding on Button 21
   if (strcmp(config.encoding, "IPTS in") == 0)
   {
-    AmendButtonStatus(9, 21, 0, "Encoding^IPTS in", &Blue);
-    AmendButtonStatus(9, 21, 1, "Encoding^IPTS in", &Green);
-    AmendButtonStatus(9, 21, 2, "Encoding^IPTS in", &Grey);
+    AmendButtonStatus(9, 21, 0, "Encoding^IPTS in", &Grey);
   }
   if (strcmp(config.encoding, "IPTS in H264") == 0)
   {
-    AmendButtonStatus(9, 21, 0, "Encoding^IPTS in H264", &Blue);
-    AmendButtonStatus(9, 21, 1, "Encoding^IPTS in H264", &Green);
-    AmendButtonStatus(9, 21, 2, "Encoding^IPTS in H264", &Grey);
+    AmendButtonStatus(9, 21, 0, "Encoding^IPTS in H264", &Grey);
   }
   if (strcmp(config.encoding, "IPTS in H265") == 0)
   {
-    AmendButtonStatus(9, 21, 0, "Encoding^IPTS in H265", &Blue);
-    AmendButtonStatus(9, 21, 1, "Encoding^IPTS in H265", &Green);
-    AmendButtonStatus(9, 21, 2, "Encoding^IPTS in H265", &Grey);
+    AmendButtonStatus(9, 21, 0, "Encoding^IPTS in H265", &Grey);
   }
   if (strcmp(config.encoding, "MPEG-2") == 0)
   {
-    AmendButtonStatus(9, 21, 0, "Encoding^MPEG-2", &Blue);
-    AmendButtonStatus(9, 21, 1, "Encoding^MPEG-2", &Green);
-    AmendButtonStatus(9, 21, 2, "Encoding^MPEG-2", &Grey);
+    AmendButtonStatus(9, 21, 0, "Encoding^MPEG-2", &Grey);
   }
   if (strcmp(config.encoding, "H264") == 0)
   {
-    AmendButtonStatus(9, 21, 0, "Encoding^H264", &Blue);
-    AmendButtonStatus(9, 21, 1, "Encoding^H264", &Green);
-    AmendButtonStatus(9, 21, 2, "Encoding^H264", &Grey);
+    AmendButtonStatus(9, 21, 0, "Encoding^H264",&Grey);
   }
   if (strcmp(config.encoding, "H265") == 0)
   {
-    AmendButtonStatus(9, 21, 0, "Encoding^H265", &Blue);
-    AmendButtonStatus(9, 21, 1, "Encoding^H265", &Green);
-    AmendButtonStatus(9, 21, 2, "Encoding^H265", &Grey);
+    AmendButtonStatus(9, 21, 0, "Encoding^H265",&Grey);
   }
   if (strcmp(config.encoding, "H266") == 0)
   {
-    AmendButtonStatus(9, 21, 0, "Encoding^H266", &Blue);
-    AmendButtonStatus(9, 21, 1, "Encoding^H266", &Green);
-    AmendButtonStatus(9, 21, 2, "Encoding^H266", &Grey);
+    AmendButtonStatus(9, 21, 0, "Encoding^H266", &Grey);
   }
   if (strcmp(config.encoding, "TS File") == 0)
   {
-    AmendButtonStatus(9, 21, 0, "Encoding^from TS File", &Blue);
-    AmendButtonStatus(9, 21, 1, "Encoding^from TS File", &Green);
-    AmendButtonStatus(9, 21, 2, "Encoding^from TS File", &Grey);
+    AmendButtonStatus(9, 21, 0, "Encoding^from TS File", &Grey);
   }
-  SetButtonStatus(9, 21, 2);
 
   // Display Correct Output Format on Button 23
   if (strcmp(config.format, "4:3") == 0)
   {
-    AmendButtonStatus(9, 23, 0, "Format^4:3", &Blue);
-    AmendButtonStatus(9, 23, 1, "Format^4:3", &Green);
-    AmendButtonStatus(9, 23, 2, "Format^4:3", &Grey);
+    AmendButtonStatus(9, 23, 0, "Format^4:3", &Grey);
   }
   if (strcmp(config.format, "16:9") == 0)
   {
-    AmendButtonStatus(9, 23, 0, "Format^16:9", &Blue);
-    AmendButtonStatus(9, 23, 1, "Format^16:9", &Green);
-    AmendButtonStatus(9, 23, 2, "Format^16:9", &Grey);
+    AmendButtonStatus(9, 23, 0, "Format^16:9", &Grey);
   }
   if (strcmp(config.format, "720p") == 0)
   {
-    AmendButtonStatus(9, 23, 0, "Format^720p", &Blue);
-    AmendButtonStatus(9, 23, 1, "Format^720p", &Green);
-    AmendButtonStatus(9, 23, 2, "Format^720p", &Grey);
+    AmendButtonStatus(9, 23, 0, "Format^720p", &Grey);
   }
   if (strcmp(config.format, "1080p") == 0)
   {
-    AmendButtonStatus(9, 23, 0, "Format^1080p", &Blue);
-    AmendButtonStatus(9, 23, 1, "Format^1080p", &Green);
-    AmendButtonStatus(9, 23, 2, "Format^1080p", &Grey);
+    AmendButtonStatus(9, 23, 0, "Format^1080p", &Grey);
   }
-  SetButtonStatus(9, 23, 2);
 
   // Display source on button 24
   if (strcmp(config.videosource, "PiCam") == 0)
   {
-    AmendButtonStatus(9, 24, 0, "Source^Pi Cam", &Blue);
-    AmendButtonStatus(9, 24, 1, "Source^Pi Cam", &Green);
-    AmendButtonStatus(9, 24, 2, "Source^Pi Cam", &Grey);
+    AmendButtonStatus(9, 24, 0, "Source^Pi Cam", &Grey);
   }
   if (strcmp(config.videosource, "WebCam") == 0)
   {
-    AmendButtonStatus(9, 24, 0, "Source^Web Cam", &Blue);
-    AmendButtonStatus(9, 24, 1, "Source^Web Cam", &Green);
-    AmendButtonStatus(9, 24, 2, "Source^Web Cam", &Grey);
+    AmendButtonStatus(9, 24, 0, "Source^Web Cam", &Grey);
   }
   if (strcmp(config.videosource, "ATEMUSB") == 0)
   {
-    AmendButtonStatus(9, 24, 0, "Source^ATEM USB", &Blue);
-    AmendButtonStatus(9, 24, 1, "Source^ATEM USB", &Green);
-    AmendButtonStatus(9, 24, 2, "Source^ATEM USB", &Grey);
+    AmendButtonStatus(9, 24, 0, "Source^ATEM USB", &Grey);
   }
   if (strcmp(config.videosource, "TestCard") == 0)
   {
-    AmendButtonStatus(9, 24, 0, "Source^Test Card", &Blue);
-    AmendButtonStatus(9, 24, 1, "Source^Test Card", &Green);
-    AmendButtonStatus(9, 24, 2, "Source^Test Card", &Grey);
+    AmendButtonStatus(9, 24, 0, "Source^Test Card", &Grey);
   }
-  SetButtonStatus(9, 24, 2);
 }
 
 
@@ -4581,6 +4721,9 @@ void Define_Menu13()
   AddButtonStatus(13, 13, "DATV Express^32 bit", &Blue);
   AddButtonStatus(13, 13, "DATV Express^32 bit", &Green);
 
+  AddButtonStatus(13, 14, "LibreSDR^ ", &Blue);
+  AddButtonStatus(13, 14, "LibreSDR^ ", &Green);
+
   AddButtonStatus(13, 15, "LimeSDR^Mini", &Blue);
   AddButtonStatus(13, 15, "LimeSDR^Mini", &Green);
 
@@ -4603,7 +4746,7 @@ void Define_Menu13()
 void Highlight_Menu13()
 {
   SelectFromGroupOnMenu3(13, 5, 1, config.modeoutput, "STREAMER", "IPTSOUT", "HDMI");
-  SelectFromGroupOnMenu4(13, 10, 1, config.modeoutput, "PLUTO", "PLUTOF5OEO", "EXPRESS16", "EXPRESS32");
+  SelectFromGroupOnMenu5(13, 10, 1, config.modeoutput, "PLUTO", "PLUTOF5OEO", "EXPRESS16", "EXPRESS32", "LIBRESDR");
   SelectFromGroupOnMenu5(13, 15, 1, config.modeoutput, "LIMEMINI", "LIMEDVB", "LIMEUSB", "LIMEXTRX", "LIMEMINING");
 }
 
@@ -5203,7 +5346,7 @@ void Define_Menu23()
 
   AddButtonStatus(23, 9, "Audio out^RPi Jack", &Blue);
   AddButtonStatus(23, 9, "Audio out^USB Dongle", &Blue);
-  AddButtonStatus(23, 9, "Audio out^HDMI", &Grey);
+  AddButtonStatus(23, 9, "Audio out^HDMI", &Blue);
   AddButtonStatus(23, 9, "Audio out^Custom", &Grey);
 
   // 3rd Row, Menu 23
@@ -5217,7 +5360,7 @@ void Define_Menu23()
   AddButtonStatus(23, 13, "Modulation^DVB-S/S2", &Blue);
   AddButtonStatus(23, 13, "Modulation^DVB-T", &Grey);
 
-  //AddButtonStatus(23, 14, "Show Touch^Overlay", &Blue);
+  AddButtonStatus(23, 14, "Set VLC^Volume", &Blue);
 
   AddButtonStatus(23, 25, "QO-100", &Blue);
   AddButtonStatus(23, 25, "Terrestrial^ ", &Blue);
@@ -5754,6 +5897,52 @@ void Highlight_Menu33()
 }
 
 
+void Define_Menu39()
+{
+  strcpy(MenuTitle[39], "Test Card Selection Menu (39)");
+
+  // Bottom Row, Menu 39
+
+  AddButtonStatus(39, 3, "Caption^On", &Green);
+  AddButtonStatus(39, 3, "Caption^Off", &Blue);
+
+  AddButtonStatus(39, 4, "Exit to^Main Menu", &DBlue);
+
+  // 4th Row, Menu 39
+
+  AddButtonStatus(39, 20, "Test Card^F", &Blue);
+  AddButtonStatus(39, 20, "Test Card^F", &Green);
+
+  AddButtonStatus(39, 21, "Test Card^C", &Blue);
+  AddButtonStatus(39, 21, "Test Card^C", &Green);
+
+  AddButtonStatus(39, 22, "PM5544^ ", &Blue);
+  AddButtonStatus(39, 22, "PM5544^ ", &Green);
+
+  AddButtonStatus(39, 23, "Colour Bars^ ", &Blue);
+  AddButtonStatus(39, 23, "Colour Bars^ ", &Green);
+
+  AddButtonStatus(39, 24, "Grey Scale^ ", &Blue);
+  AddButtonStatus(39, 24, "Grey Scale^ ", &Green);
+
+}
+
+
+void Highlight_Menu39()
+{
+  SelectFromGroupOnMenu5(39, 20, 1, testcard, "tcf", "tcc", "pm5544", "colourbars", "greyscale");
+
+  if (strcmp(caption, "on") == 0)
+  {
+    SetButtonStatus(39, 3, 0);
+  }
+  else
+  {
+    SetButtonStatus(39, 3, 1);
+  }
+}
+
+
 void Define_Menu41()
 {
 
@@ -5999,6 +6188,7 @@ void Define_Menus()
   Define_Menu31();
   Define_Menu32();
   Define_Menu33();
+  Define_Menu39();
 
   Define_Menu41();
 }
@@ -6868,6 +7058,9 @@ void selectOutput(int Button)          // Transmitter output device
       break;
     case 13:
       strcpy(config.modeoutput, "EXPRESS32");
+      break;
+    case 14:
+      strcpy(config.modeoutput, "LIBRESDR");
       break;
     case 15:
       strcpy(config.modeoutput, "LIMEMINI");
@@ -8076,6 +8269,85 @@ void ChangeCustomAudioOut()
 }
 
 
+void ChangeMasterVolume()
+{
+  bool valid = false;
+  char KeyboardReturn[63];
+  char oldVolume[63];
+  char feedbackMessage[255];
+
+  // Ask for the new master volume
+  snprintf(oldVolume, 62, "%d", masterAudioVolume);
+  while (valid == false)
+  {
+    Keyboard("Enter the new master volume as a percentage (0 - 100)", oldVolume, 3, KeyboardReturn, true);
+    if ((atoi(KeyboardReturn) >= 0) && (atoi(KeyboardReturn) <= 100))
+    {
+      valid = true;
+    }
+  }
+
+  if (atoi(KeyboardReturn) != masterAudioVolume)   //  Entry has been changed
+  {
+    masterAudioVolume = atoi(KeyboardReturn);
+
+    // Save the new value
+    SetConfigParam(PATH_SCONFIG, "masteraudiovolume", KeyboardReturn);
+    printf ("Master Volume set to %s percent\n", KeyboardReturn);
+  }
+
+  // Set (or reset) the value
+  SetMasterVolume();
+
+  snprintf(feedbackMessage, 250, "Master Volume set to %d%%", masterAudioVolume);
+  MsgBox4("", feedbackMessage, "", "");
+  usleep(1000000); 
+}
+
+
+void SetMasterVolume()
+{
+  char setMasterVolumeCommand[255];
+
+  snprintf(setMasterVolumeCommand, 250, "/home/pi/portsdown/scripts/receive/setmastervolume.sh %d &", masterAudioVolume); 
+  system(setMasterVolumeCommand);
+}
+
+
+void ChangeVLCVolume()
+{
+  bool valid = false;
+  char KeyboardReturn[63];
+  char oldVLCVolume[63];
+  char feedbackMessage[255];
+
+  // Ask for the new VLC volume
+  snprintf(oldVLCVolume, 62, "%d", CurrentVLCVolume);
+  while (valid == false)
+  {
+    Keyboard("Enter the new VLC volume in the range 0 - 512", oldVLCVolume, 3, KeyboardReturn, true);
+    if ((atoi(KeyboardReturn) >= 0) && (atoi(KeyboardReturn) <= 512))
+    {
+      valid = true;
+    }
+  }
+
+  if (atoi(KeyboardReturn) != CurrentVLCVolume)   //  Entry has been changed
+  {
+    CurrentVLCVolume = atoi(KeyboardReturn);
+
+    // Save the new value
+    SetConfigParam(PATH_PCONFIG, "vlcvolume", KeyboardReturn);
+    printf ("VLC Volume set to %s\n", KeyboardReturn);
+  }
+
+  snprintf(feedbackMessage, 250, "VLC Volume set to %d", CurrentVLCVolume);
+  MsgBox4("", feedbackMessage, "on a scale of 0 to 512", "");
+  usleep(1000000); 
+}
+
+
+
 void CheckforUpdate()
 {
   int choice;
@@ -8369,6 +8641,47 @@ void ToggleAmendStreamerPreset()
   {
     StreamerStoreTrigger = false;
   }
+}
+
+
+void SelectTestCardAction(int NoButton)
+{
+  switch (NoButton)
+  {
+    case 3:                                 // Toggle caption
+      if (strcmp (caption, "on") == 0)
+      {
+        strcpy (caption, "off");
+        SetConfigParam(PATH_PCONFIG, "caption", "off");
+      }
+      else
+      {
+        strcpy (caption, "on");
+        SetConfigParam(PATH_PCONFIG, "caption", "on");
+      }
+      break;
+    case 20:                               // Test Card F
+      strcpy(testcard, "tcf");
+      SetConfigParam(PATH_PCONFIG, "testcard", testcard);
+      break;
+    case 21:                               // Test Card C
+      strcpy(testcard, "tcc");
+      SetConfigParam(PATH_PCONFIG, "testcard", testcard);
+      break;
+    case 22:                               // pm5544
+      strcpy(testcard, "pm5544");
+      SetConfigParam(PATH_PCONFIG, "testcard", testcard);
+      break;
+    case 23:                               // Colour Bars
+      strcpy(testcard, "colourbars");
+      SetConfigParam(PATH_PCONFIG, "testcard", testcard);
+      break;
+    case 24:                               // Greyscale
+      strcpy(testcard, "greyscale");
+      SetConfigParam(PATH_PCONFIG, "testcard", testcard);
+      break;
+  }
+  //printf("Testcard %s selected, caption %s\n", testcard, caption);
 }
 
 
@@ -8929,13 +9242,14 @@ void waitForScreenAction()
           CurrentMenu = 1;
           redrawMenu();
           break;
+        case 15:                        // Select Test Card Menu
+          printf("MENU 39 \n");
+          CurrentMenu = 39;
+          redrawMenu();
+          break;
         case 20:                        // Set Stream Output Menu
           printf("MENU 26 \n");
           CurrentMenu = 26;
-          redrawMenu();
-          break;
-        case 21:                        // Set Custom Audio Device
-          ChangeCustomAudioOut();
           redrawMenu();
           break;
         }
@@ -9012,6 +9326,22 @@ void waitForScreenAction()
         case 4:                        // Back to Main Menu
           printf("MENU 1 \n");
           CurrentMenu = 1;
+          redrawMenu();
+          break;
+        case 20:                        // Set Custom Audio Device
+          ChangeMasterVolume();
+          redrawMenu();
+          break;
+        case 21:                        // Set VLC Volume 
+          ChangeVLCVolume();
+          redrawMenu();
+          break;
+        case 22:                        // Set Custom Audio Device
+          ChangeCustomAudioOut();
+          redrawMenu();
+          break;
+        case 24:                        // Change Audio out
+          CycleLMRXaudio();
           redrawMenu();
           break;
         }
@@ -9231,6 +9561,7 @@ void waitForScreenAction()
         case 11:
         case 12:
         case 13:
+        case 14:
         case 15:
         case 16:
         case 17:
@@ -9597,6 +9928,10 @@ void waitForScreenAction()
           ChangeLMChan();
           redrawMenu();
           break;
+        case 14:                                         // Set VLC Volume 
+          ChangeVLCVolume();
+          redrawMenu();
+          break;
         case 25:                        // Toggle QO-100/Terrestrial
           toggleLMRXmode();
           redrawMenu();
@@ -9724,6 +10059,29 @@ void waitForScreenAction()
           break;
         case 9:                                          //  Amend Preset
           ToggleAmendStreamerPreset();
+          redrawMenu();
+          break;
+        }
+        continue;
+      }
+      if (CurrentMenu == 39)           // Set Stream Outputs Menu
+      {
+        printf("Menu %d, Button %d\n", CallingMenu, i);
+        CallingMenu = 39;
+        switch (i)
+        {
+        case 4:                                          // Back to Main Menu
+          printf("MENU 1 \n");
+          CurrentMenu = 1;
+          redrawMenu();
+          break;
+        case 3:                                           // toggle caption on/off 
+        case 20:                                          // testcard f 
+        case 21:                                          // test card c 
+        case 22:                                          // pm5544 
+        case 23:                                          // colour bars 
+        case 24:                                          // grey scale 
+          SelectTestCardAction(i);                        // 
           redrawMenu();
           break;
         }
@@ -9890,6 +10248,7 @@ int main(int argc, char **argv)
   CheckConfigFile();
   ReadSavedParams();
   checkSnapIndex();
+  SetMasterVolume();
   redrawMenu();
   usleep(1000000);
   redrawMenu();  // Second time over-writes system message
